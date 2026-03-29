@@ -14,13 +14,45 @@
 bool g_enableRanging = true;
 bool g_enableHttpReport = true;
 
+#ifndef WIFI_SSID
+#define WIFI_SSID ""
+#define WIFI_SSID_FROM_ENV 0
+#else
+#define WIFI_SSID_FROM_ENV 1
+#endif
+
+#ifndef WIFI_PASS
+#define WIFI_PASS ""
+#define WIFI_PASS_FROM_ENV 0
+#else
+#define WIFI_PASS_FROM_ENV 1
+#endif
+
+#ifndef WIFI_CREDENTIALS_STRICT
+#define WIFI_CREDENTIALS_STRICT 1
+#endif
+
+#if WIFI_SSID_FROM_ENV == 0
+#warning "WIFI_SSID not injected from build flags. It is empty by default."
+#endif
+
+#if WIFI_PASS_FROM_ENV == 0
+#warning "WIFI_PASS not injected from build flags. It is empty by default."
+#endif
+
+constexpr bool WIFI_SSID_CONFIGURED = (sizeof(WIFI_SSID) > 1);
+constexpr bool WIFI_PASS_CONFIGURED = (sizeof(WIFI_PASS) > 1);
+
+#if WIFI_CREDENTIALS_STRICT
+static_assert(WIFI_SSID_CONFIGURED, "WIFI_SSID is empty. Set env var WIFI_SSID before build.");
+static_assert(WIFI_PASS_CONFIGURED, "WIFI_PASS is empty. Set env var WIFI_PASS before build.");
+#endif
+
 // I2C pins
 constexpr int I2C_SDA = 21;
 constexpr int I2C_SCL = 22;
 
-// WiFi arguments
-constexpr const char* WIFI_SSID = "myssid";
-constexpr const char* WIFI_PASS = "mypasswd";
+// WiFi arguments (injected from build_flags + system env vars)
 constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 10000;
 
 // HTTP report arguments
@@ -301,6 +333,13 @@ bool initWiFi()
     if (!g_enableHttpReport)
     {
         return true;
+    }
+
+    if (strlen(WIFI_SSID) == 0 || strlen(WIFI_PASS) == 0)
+    {
+        Serial.println("[WARN] WIFI_SSID or WIFI_PASS is empty, HTTP report disabled");
+        g_enableHttpReport = false;
+        return false;
     }
 
     WiFi.mode(WIFI_STA);
