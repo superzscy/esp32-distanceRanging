@@ -3,6 +3,8 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <Adafruit_VL53L1X.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
 #include <algorithm>
 
 // =========================
@@ -10,10 +12,20 @@
 // =========================
 
 bool g_enableRanging = true;
+bool g_enableHttpReport = true;
 
 // I2C pins
 constexpr int I2C_SDA = 21;
 constexpr int I2C_SCL = 22;
+
+// WiFi arguments
+constexpr const char* WIFI_SSID = "myssid";
+constexpr const char* WIFI_PASS = "mypasswd";
+constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 10000;
+
+// HTTP report arguments
+constexpr const char* REPORT_SERVER = "http://debian.lan:8088";
+constexpr const char* REPORT_API = "/api/distance";
 
 // OLED arguments
 constexpr int SCREEN_WIDTH  = 128;
@@ -266,6 +278,109 @@ bool computeStableAverageMm(const int* samples, int count, int& outAverage)
     return true;
 }
 
+String buildReportUrl()
+{
+    String url = REPORT_SERVER;
+    String api = REPORT_API;
+
+    if (url.endsWith("/") && api.startsWith("/"))
+    {
+        url.remove(url.length() - 1);
+    }
+    else if (!url.endsWith("/") && !api.startsWith("/"))
+    {
+        url += "/";
+    }
+
+    url += api;
+    return url;
+}
+
+bool initWiFi()
+{
+    if (!g_enableHttpReport)
+    {
+        return true;
+    }
+
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+    const uint32_t startMs = millis();
+    while (WiFi.status() != WL_CONNECTED && (millis() - startMs) < WIFI_CONNECT_TIMEOUT_MS)
+    {
+        delay(200);
+    }
+
+    if (WiFi.status() != WL_CONNECTED)
+    {
+        Serial.println("[WARN] WiFi connect timeout, HTTP report disabled");
+        g_enableHttpReport = false;
+        return false;
+    }
+
+    Serial.print("[INFO] WiFi connected, IP = ");
+    Serial.println(WiFi.localIP());
+    return true;
+}
+
+void reportDistanceJson(bool hasValidDistance, int distanceMm, int sampleCount, int dataReadyCount, int validCount)
+{
+    if (!g_enableHttpReport)
+    {
+        return;
+    }
+
+    if (WiFi.status() != WL_CONNECTED)
+    {
+        static uint32_t lastWarnMs = 0;
+        uint32_t now = millis();
+        if (now - lastWarnMs >= 5000)
+        {
+            Serial.println("[WARN] WiFi disconnected, skip HTTP report");
+            lastWarnMs = now;
+        }
+        return;
+    }
+
+    String payload = "{";
+    payload += "\"ts_ms\":";
+    payload += millis();
+    payload += ",\"has_valid_distance\":";
+    payload += (hasValidDistance ? "true" : "false");
+    payload += ",\"distance_mm\":";
+    payload += hasValidDistance ? String(distanceMm) : "null";
+    payload += ",\"sample_count\":";
+    payload += sampleCount;
+    payload += ",\"data_ready_count\":";
+    payload += dataReadyCount;
+    payload += ",\"valid_count\":";
+    payload += validCount;
+    payload += "}";
+
+    HTTPClient http;
+    const String url = buildReportUrl();
+    if (!http.begin(url))
+    {
+        Serial.println("[WARN] HTTP begin failed");
+        return;
+    }
+
+    http.addHeader("Content-Type", "application/json");
+    const int code = http.POST(payload);
+    if (code > 0)
+    {
+        Serial.print("[INFO] Report POST code = ");
+        Serial.println(code);
+    }
+    else
+    {
+        Serial.print("[WARN] Report POST failed, code = ");
+        Serial.println(code);
+    }
+    http.end();
+}
+
 // =========================
 // Arduino entry
 // =========================
@@ -281,6 +396,8 @@ void setup()
     Serial.println("================================");
 
     Wire.begin(I2C_SDA, I2C_SCL);
+
+    initWiFi();
 
     // Init OLED
     bool oledOk = initOLED();
@@ -369,6 +486,7 @@ void loop()
         if (computeStableAverageMm(samples, sampleCount, stableAverageMm))
         {
             showDistanceScreen(stableAverageMm);
+            reportDistanceJson(true, stableAverageMm, sampleCount, dataReadyCount, validCount);
             Serial.print("[INFO] Stable Avg = ");
             Serial.print(stableAverageMm);
             Serial.print(" mm, kept = ");
@@ -382,6 +500,7 @@ void loop()
         else
         {
             showCenteredText("Measuring...", "No valid data");
+            reportDistanceJson(false, 0, sampleCount, dataReadyCount, validCount);
             Serial.print("[WARN] No valid window data, kept = ");
             Serial.print(sampleCount);
             Serial.print(", dataReady = ");
