@@ -11,8 +11,8 @@
 // arguments
 // =========================
 
-bool g_enableRanging = true;
-bool g_enableHttpReport = true;
+bool g_enableRanging = false;
+bool g_enableHttpReport = false;
 
 #ifndef WIFI_SSID
 #define WIFI_SSID ""
@@ -43,11 +43,6 @@ bool g_enableHttpReport = true;
 constexpr bool WIFI_SSID_CONFIGURED = (sizeof(WIFI_SSID) > 1);
 constexpr bool WIFI_PASS_CONFIGURED = (sizeof(WIFI_PASS) > 1);
 
-#if WIFI_CREDENTIALS_STRICT
-static_assert(WIFI_SSID_CONFIGURED, "WIFI_SSID is empty. Set env var WIFI_SSID before build.");
-static_assert(WIFI_PASS_CONFIGURED, "WIFI_PASS is empty. Set env var WIFI_PASS before build.");
-#endif
-
 // I2C pins
 constexpr int I2C_SDA = 21;
 constexpr int I2C_SCL = 22;
@@ -77,6 +72,8 @@ constexpr uint8_t MAX_EMPTY_WINDOWS_BEFORE_RECOVER = 3;
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 Adafruit_VL53L1X vl53 = Adafruit_VL53L1X();
+bool g_isRangingActive = false;
+bool g_isWiFiActive = false;
 
 // =========================
 // helper function
@@ -189,7 +186,11 @@ bool initVL53L1X()
         Serial.println("[WARN] Failed to set inter-measurement period");
     }
 
-    vl53.startRanging();
+    if (!vl53.startRanging())
+    {
+        Serial.println("[ERROR] VL53L1X start ranging failed");
+        return false;
+    }
     Serial.println("[INFO] VL53L1X ranging started");
     return true;
 }
@@ -244,6 +245,7 @@ bool readDistanceMm(int& outDistance, bool& outHadDataReady)
     outDistance = distance;
     return true;
 }
+
 bool computeStableAverageMm(const int* samples, int count, int& outAverage)
 {
     if (count <= 0)
@@ -330,15 +332,9 @@ String buildReportUrl()
 
 bool initWiFi()
 {
-    if (!g_enableHttpReport)
-    {
-        return true;
-    }
-
     if (strlen(WIFI_SSID) == 0 || strlen(WIFI_PASS) == 0)
     {
-        Serial.println("[WARN] WIFI_SSID or WIFI_PASS is empty, HTTP report disabled");
-        g_enableHttpReport = false;
+        Serial.println("[WARN] WIFI_SSID or WIFI_PASS is empty");
         return false;
     }
 
@@ -353,8 +349,7 @@ bool initWiFi()
 
     if (WiFi.status() != WL_CONNECTED)
     {
-        Serial.println("[WARN] WiFi connect timeout, HTTP report disabled");
-        g_enableHttpReport = false;
+        Serial.println("[WARN] WiFi connect timeout");
         return false;
     }
 
@@ -365,7 +360,7 @@ bool initWiFi()
 
 void reportDistanceJson(bool hasValidDistance, int distanceMm, int sampleCount, int dataReadyCount, int validCount)
 {
-    if (!g_enableHttpReport)
+    if (!g_enableHttpReport || !g_isWiFiActive)
     {
         return;
     }
@@ -420,6 +415,72 @@ void reportDistanceJson(bool hasValidDistance, int distanceMm, int sampleCount, 
     http.end();
 }
 
+void processSerialCommands()
+{
+    static String cmd;
+    while (Serial.available() > 0)
+    {
+        const char ch = static_cast<char>(Serial.read());
+        if (ch == '\r')
+        {
+            continue;
+        }
+        if (ch != '\n')
+        {
+            cmd += ch;
+            continue;
+        }
+
+        cmd.trim();
+        if (cmd.length() == 0)
+        {
+            continue;
+        }
+
+        if (cmd == "w 0")
+        {
+            g_enableHttpReport = false;
+            Serial.println("[CMD] WiFi disable requested");
+        }
+        else if (cmd == "w 1")
+        {
+            g_enableHttpReport = true;
+            Serial.println("[CMD] WiFi enable requested");
+        }
+        else
+        {
+            Serial.println("[CMD] Unsupported command. Use: w 0 | w 1");
+        }
+
+        cmd = "";
+    }
+}
+
+void stopWiFiIfNeeded()
+{
+    if (!g_isWiFiActive)
+    {
+        return;
+    }
+    
+    g_enableRanging = false;
+    WiFi.disconnect(true, true);
+    WiFi.mode(WIFI_OFF);
+    g_isWiFiActive = false;
+    Serial.println("[INFO] WiFi stopped");
+}
+
+void stopRangingIfNeeded()
+{
+    if (!g_isRangingActive)
+    {
+        return;
+    }
+    vl53.stopRanging();
+    g_isRangingActive = false;
+    Serial.println("[INFO] Ranging stopped");
+}
+
 // =========================
 // Arduino entry
 // =========================
@@ -436,8 +497,6 @@ void setup()
 
     Wire.begin(I2C_SDA, I2C_SCL);
 
-    initWiFi();
-
     // Init OLED
     bool oledOk = initOLED();
     if (!oledOk)
@@ -452,33 +511,14 @@ void setup()
 
     showCenteredText("System Booting");
 
-    if (g_enableRanging)
-    {
-        Serial.println("[INFO] Ranging enabled");
-
-        if (!initVL53L1X())
-        {
-            showErrorScreen("VL53L1X init fail");
-            while (true)
-            {
-                Serial.println("[FATAL] VL53L1X init failed");
-                delay(1000);
-            }
-        }
-
-        showCenteredText("Ranging ON", "Init OK");
-        delay(800);
-    }
-    else
-    {
-        Serial.println("[INFO] Ranging disabled by switch");
-        showCenteredText("Ranging OFF");
-        delay(800);
-    }
+    showCenteredText("Ranging OFF", "WiFi OFF");
+    delay(400);
 }
 
 void loop()
 {
+    processSerialCommands();
+
     static uint32_t windowStartMs = 0;
     static uint32_t lastSampleMs  = 0;
     static int samples[SAMPLES_PER_SECOND];
@@ -486,6 +526,20 @@ void loop()
     static int dataReadyCount = 0;
     static int validCount = 0;
     static uint8_t emptyWindowCount = 0;
+    static bool lastRangingEnabled = false;
+    static bool lastHttpEnabled = false;
+    static uint32_t lastRangingInitAttemptMs = 0;
+    static uint32_t lastWiFiAttemptMs = 0;
+    static uint32_t lastOffLogMs = 0;
+
+    auto resetWindow = [&]() {
+        sampleCount = 0;
+        dataReadyCount = 0;
+        validCount = 0;
+        emptyWindowCount = 0;
+        windowStartMs = millis();
+        lastSampleMs = windowStartMs - SAMPLE_INTERVAL_MS;
+    };
 
     uint32_t now = millis();
     if (windowStartMs == 0)
@@ -494,10 +548,67 @@ void loop()
         lastSampleMs = now - SAMPLE_INTERVAL_MS;
     }
 
-    if (!g_enableRanging)
+    // Runtime WiFi on/off handling
+    if (g_enableHttpReport && !g_isWiFiActive)
     {
-        showCenteredText("Ranging OFF", "Set g_enableRanging");
-        Serial.println("[INFO] Ranging is disabled");
+        if (now - lastWiFiAttemptMs >= 3000)
+        {
+            lastWiFiAttemptMs = now;
+            g_isWiFiActive = initWiFi();
+            if (g_isWiFiActive)
+            {
+                g_enableRanging = true;
+            }
+            else
+            {
+                g_enableRanging = false;
+                Serial.println("[WARN] WiFi enable requested but not ready");
+            }
+        }
+    }
+    else if (!g_enableHttpReport && g_isWiFiActive)
+    {
+        stopWiFiIfNeeded();
+    }
+
+    // Runtime ranging on/off handling
+    if (g_enableRanging && !g_isRangingActive)
+    {
+        if (now - lastRangingInitAttemptMs >= 1000)
+        {
+            lastRangingInitAttemptMs = now;
+            if (initVL53L1X())
+            {
+                g_isRangingActive = true;
+                resetWindow();
+                showCenteredText("Ranging ON", g_isWiFiActive ? "WiFi ON" : "WiFi OFF");
+            }
+            else
+            {
+                Serial.println("[WARN] Ranging enable requested but init failed");
+            }
+        }
+    }
+    else if (!g_enableRanging && g_isRangingActive)
+    {
+        stopRangingIfNeeded();
+        resetWindow();
+        showCenteredText("Ranging OFF", g_isWiFiActive ? "WiFi ON" : "WiFi OFF");
+    }
+
+    if (!g_isRangingActive)
+    {
+        if (g_enableRanging != lastRangingEnabled || g_enableHttpReport != lastHttpEnabled)
+        {
+            showCenteredText("Ranging OFF", g_isWiFiActive ? "WiFi ON" : "WiFi OFF");
+            lastRangingEnabled = g_enableRanging;
+            lastHttpEnabled = g_enableHttpReport;
+        }
+        if (now - lastOffLogMs >= 3000)
+        {
+            lastOffLogMs = now;
+            Serial.println("[INFO] Ranging is currently OFF");
+        }
         delay(20);
         return;
     }
