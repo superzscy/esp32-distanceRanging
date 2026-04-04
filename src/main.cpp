@@ -579,6 +579,7 @@ void loop()
     static uint8_t emptyWindowCount = 0;
     static bool lastRangingEnabled = false;
     static bool lastHttpEnabled = false;
+    static bool lastBtClientConnected = false;
     static uint32_t lastRangingInitAttemptMs = 0;
     static uint32_t lastWiFiAttemptMs = 0;
     static uint32_t lastOffLogMs = 0;
@@ -598,6 +599,18 @@ void loop()
         windowStartMs = now;
         lastSampleMs = now - SAMPLE_INTERVAL_MS;
     }
+
+    const bool btClientConnected = g_isBluetoothActive && SerialBT.hasClient();
+    if (lastBtClientConnected && !btClientConnected)
+    {
+        if (g_enableHttpReport || g_isWiFiActive)
+        {
+            g_enableHttpReport = false;
+            stopWiFiIfNeeded();
+            Serial.println("[INFO] Bluetooth disconnected, WiFi auto disabled");
+        }
+    }
+    lastBtClientConnected = btClientConnected;
 
     // Runtime WiFi on/off handling
     if (g_enableHttpReport && !g_isWiFiActive)
