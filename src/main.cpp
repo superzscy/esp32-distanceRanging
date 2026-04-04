@@ -5,6 +5,7 @@
 #include <Adafruit_VL53L1X.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <BluetoothSerial.h>
 #include <algorithm>
 
 // =========================
@@ -49,6 +50,7 @@ constexpr int I2C_SCL = 22;
 
 // WiFi arguments (injected from build_flags + system env vars)
 constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 10000;
+constexpr const char* BT_DEVICE_NAME = "DR-ESP32";
 
 // HTTP report arguments
 constexpr const char* REPORT_SERVER = "http://debian.lan:8088";
@@ -72,8 +74,10 @@ constexpr uint8_t MAX_EMPTY_WINDOWS_BEFORE_RECOVER = 3;
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 Adafruit_VL53L1X vl53 = Adafruit_VL53L1X();
+BluetoothSerial SerialBT;
 bool g_isRangingActive = false;
 bool g_isWiFiActive = false;
+bool g_isBluetoothActive = false;
 
 // =========================
 // helper function
@@ -415,45 +419,90 @@ void reportDistanceJson(bool hasValidDistance, int distanceMm, int sampleCount, 
     http.end();
 }
 
-void processSerialCommands()
+void logCommandMessage(const String& msg)
 {
-    static String cmd;
-    while (Serial.available() > 0)
+    Serial.println(msg);
+    if (g_isBluetoothActive && SerialBT.hasClient())
     {
-        const char ch = static_cast<char>(Serial.read());
+        SerialBT.println(msg);
+    }
+}
+
+void handleCommandLine(const String& cmdLine, const char* source)
+{
+    if (cmdLine == "w 0")
+    {
+        g_enableHttpReport = false;
+        logCommandMessage(String("[CMD][") + source + "] WiFi disable requested");
+    }
+    else if (cmdLine == "w 1")
+    {
+        g_enableHttpReport = true;
+        logCommandMessage(String("[CMD][") + source + "] WiFi enable requested");
+    }
+    else
+    {
+        logCommandMessage(String("[CMD][") + source + "] Unsupported command. Use: w 0 | w 1");
+    }
+}
+
+void processCommandStream(Stream& stream, String& buffer, const char* source)
+{
+    while (stream.available() > 0)
+    {
+        const char ch = static_cast<char>(stream.read());
         if (ch == '\r')
         {
             continue;
         }
         if (ch != '\n')
         {
-            cmd += ch;
+            buffer += ch;
             continue;
         }
 
-        cmd.trim();
-        if (cmd.length() == 0)
+        buffer.trim();
+        if (buffer.length() > 0)
         {
-            continue;
+            handleCommandLine(buffer, source);
         }
-
-        if (cmd == "w 0")
-        {
-            g_enableHttpReport = false;
-            Serial.println("[CMD] WiFi disable requested");
-        }
-        else if (cmd == "w 1")
-        {
-            g_enableHttpReport = true;
-            Serial.println("[CMD] WiFi enable requested");
-        }
-        else
-        {
-            Serial.println("[CMD] Unsupported command. Use: w 0 | w 1");
-        }
-
-        cmd = "";
+        buffer = "";
     }
+}
+
+void processCommands()
+{
+    static String serialCmd;
+    static String btCmd;
+
+    processCommandStream(Serial, serialCmd, "SERIAL");
+    if (g_isBluetoothActive)
+    {
+        processCommandStream(SerialBT, btCmd, "BT");
+    }
+}
+
+bool initBluetooth()
+{
+    if (!SerialBT.begin(BT_DEVICE_NAME))
+    {
+        Serial.println("[WARN] Bluetooth init failed");
+        return false;
+    }
+    Serial.print("[INFO] Bluetooth SPP started: ");
+    Serial.println(BT_DEVICE_NAME);
+    return true;
+}
+
+void stopBluetoothIfNeeded()
+{
+    if (!g_isBluetoothActive)
+    {
+        return;
+    }
+    SerialBT.end();
+    g_isBluetoothActive = false;
+    Serial.println("[INFO] Bluetooth stopped");
 }
 
 void stopWiFiIfNeeded()
@@ -462,7 +511,7 @@ void stopWiFiIfNeeded()
     {
         return;
     }
-    
+
     g_enableRanging = false;
     WiFi.disconnect(true, true);
     WiFi.mode(WIFI_OFF);
@@ -495,6 +544,8 @@ void setup()
     Serial.println("ESP32 + VL53L1X + OLED Test");
     Serial.println("================================");
 
+    g_isBluetoothActive = initBluetooth();
+
     Wire.begin(I2C_SDA, I2C_SCL);
 
     // Init OLED
@@ -517,7 +568,7 @@ void setup()
 
 void loop()
 {
-    processSerialCommands();
+    processCommands();
 
     static uint32_t windowStartMs = 0;
     static uint32_t lastSampleMs  = 0;
@@ -561,7 +612,6 @@ void loop()
             }
             else
             {
-                g_enableRanging = false;
                 Serial.println("[WARN] WiFi enable requested but not ready");
             }
         }
@@ -607,7 +657,6 @@ void loop()
         if (now - lastOffLogMs >= 3000)
         {
             lastOffLogMs = now;
-            Serial.println("[INFO] Ranging is currently OFF");
         }
         delay(20);
         return;
