@@ -1,4 +1,4 @@
-#include <Arduino.h>
+﻿#include <Arduino.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
@@ -14,6 +14,7 @@
 
 bool g_enableRanging = false;
 bool g_enableHttpReport = false;
+bool g_enableDisplay = false;
 
 #ifndef WIFI_SSID
 #define WIFI_SSID ""
@@ -78,6 +79,7 @@ BluetoothSerial SerialBT;
 bool g_isRangingActive = false;
 bool g_isWiFiActive = false;
 bool g_isBluetoothActive = false;
+bool g_isDisplayActive = false;
 
 // =========================
 // helper function
@@ -85,6 +87,11 @@ bool g_isBluetoothActive = false;
 
 void showCenteredText(const String& line1, const String& line2 = "")
 {
+    if (!g_isDisplayActive)
+    {
+        return;
+    }
+
     display.clearDisplay();
     display.setTextColor(SSD1306_WHITE);
 
@@ -116,6 +123,11 @@ void showCenteredText(const String& line1, const String& line2 = "")
 
 void showDistanceScreen(int distanceMm)
 {
+    if (!g_isDisplayActive)
+    {
+        return;
+    }
+
     display.clearDisplay();
     display.setTextColor(SSD1306_WHITE);
 
@@ -135,6 +147,11 @@ void showDistanceScreen(int distanceMm)
 
 void showErrorScreen(const String& msg)
 {
+    if (!g_isDisplayActive)
+    {
+        return;
+    }
+
     display.clearDisplay();
     display.setTextColor(SSD1306_WHITE);
     display.setTextSize(1);
@@ -169,7 +186,7 @@ bool initVL53L1X()
         return false;
     }
 
-    // optional options：
+    // optional options:
     // VL53L1X::Short
     // VL53L1X::Medium
     // VL53L1X::Long
@@ -178,7 +195,7 @@ bool initVL53L1X()
         Serial.println("[WARN] Failed to set distance mode");
     }
 
-    // the bigger timing budget, the stabler it is，but slower refresh rate
+    // the bigger timing budget, the stabler it is, but slower refresh rate
     // optional values: 20, 50, 100, 200, 500
     if (!vl53.setTimingBudget(100))
     {
@@ -265,7 +282,7 @@ bool computeStableAverageMm(const int* samples, int count, int& outAverage)
     std::sort(sorted, sorted + count);
 
     const int median = sorted[count / 2];
-    const int threshold = max(60, median / 8); // 12.5%，60mm
+    const int threshold = max(60, median / 8); // 12.5%, minimum 60 mm
 
     int32_t sum = 0;
     int kept = 0;
@@ -440,9 +457,19 @@ void handleCommandLine(const String& cmdLine, const char* source)
         g_enableHttpReport = true;
         logCommandMessage(String("[CMD][") + source + "] WiFi enable requested");
     }
+    else if (cmdLine == "d 0")
+    {
+        g_enableDisplay = false;
+        logCommandMessage(String("[CMD][") + source + "] Display disable requested");
+    }
+    else if (cmdLine == "d 1")
+    {
+        g_enableDisplay = true;
+        logCommandMessage(String("[CMD][") + source + "] Display enable requested");
+    }
     else
     {
-        logCommandMessage(String("[CMD][") + source + "] Unsupported command. Use: w 0 | w 1");
+        logCommandMessage(String("[CMD][") + source + "] Unsupported command. Use: w 0 | w 1 | d 0 | d 1");
     }
 }
 
@@ -530,6 +557,19 @@ void stopRangingIfNeeded()
     Serial.println("[INFO] Ranging stopped");
 }
 
+void stopDisplayIfNeeded()
+{
+    if (!g_isDisplayActive)
+    {
+        return;
+    }
+
+    display.clearDisplay();
+    display.display();
+    g_isDisplayActive = false;
+    Serial.println("[INFO] Display stopped");
+}
+
 // =========================
 // Arduino entry
 // =========================
@@ -547,23 +587,7 @@ void setup()
     g_isBluetoothActive = initBluetooth();
 
     Wire.begin(I2C_SDA, I2C_SCL);
-
-    // Init OLED
-    bool oledOk = initOLED();
-    if (!oledOk)
-    {
-        // if OLED failed，use serial to report
-        while (true)
-        {
-            Serial.println("[FATAL] OLED init failed");
-            delay(1000);
-        }
-    }
-
-    showCenteredText("System Booting");
-
-    showCenteredText("Ranging OFF", "WiFi OFF");
-    delay(400);
+    Serial.println("[INFO] Display switch default is OFF (use d 1 to enable)");
 }
 
 void loop()
@@ -579,9 +603,11 @@ void loop()
     static uint8_t emptyWindowCount = 0;
     static bool lastRangingEnabled = false;
     static bool lastHttpEnabled = false;
+    static bool lastDisplayEnabled = false;
     static bool lastBtClientConnected = false;
     static uint32_t lastRangingInitAttemptMs = 0;
     static uint32_t lastWiFiAttemptMs = 0;
+    static uint32_t lastDisplayInitAttemptMs = 0;
     static uint32_t lastOffLogMs = 0;
 
     auto resetWindow = [&]() {
@@ -634,6 +660,28 @@ void loop()
         stopWiFiIfNeeded();
     }
 
+    // Runtime display on/off handling
+    if (g_enableDisplay && !g_isDisplayActive)
+    {
+        if (now - lastDisplayInitAttemptMs >= 1000)
+        {
+            lastDisplayInitAttemptMs = now;
+            if (initOLED())
+            {
+                g_isDisplayActive = true;
+                showCenteredText("Ranging OFF", g_isWiFiActive ? "WiFi ON" : "WiFi OFF");
+            }
+            else
+            {
+                Serial.println("[WARN] Display enable requested but init failed");
+            }
+        }
+    }
+    else if (!g_enableDisplay && g_isDisplayActive)
+    {
+        stopDisplayIfNeeded();
+    }
+
     // Runtime ranging on/off handling
     if (g_enableRanging && !g_isRangingActive)
     {
@@ -661,11 +709,12 @@ void loop()
 
     if (!g_isRangingActive)
     {
-        if (g_enableRanging != lastRangingEnabled || g_enableHttpReport != lastHttpEnabled)
+        if (g_enableRanging != lastRangingEnabled || g_enableHttpReport != lastHttpEnabled || g_enableDisplay != lastDisplayEnabled)
         {
             showCenteredText("Ranging OFF", g_isWiFiActive ? "WiFi ON" : "WiFi OFF");
             lastRangingEnabled = g_enableRanging;
             lastHttpEnabled = g_enableHttpReport;
+            lastDisplayEnabled = g_enableDisplay;
         }
         if (now - lastOffLogMs >= 3000)
         {
