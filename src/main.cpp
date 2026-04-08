@@ -98,9 +98,9 @@ bool g_isWiFiActive = false;
 bool g_isBluetoothInitialized = false;
 bool g_isDisplayActive = false;
 bool g_isLowPowerActive = false;
-int g_normalCpuFreqMhz = 0;
+volatile bool g_btClientConnected = false;
 
-constexpr int STANDBY_CPU_FREQ_MHZ = 80;
+constexpr uint32_t STANDBY_ENTER_DELAY_MS = 1500;
 
 // =========================
 // helper function
@@ -268,11 +268,6 @@ bool readDistanceMm(int& outDistance, bool& outHadDataReady)
     }
 
     vl53.clearInterrupt();
-
-    Serial.print("[DEBUG] Distance = ");
-    Serial.print(distance);
-    Serial.print(" mm, RangeStatus = ");
-    Serial.println(rangeStatus);
 
     if (rangeStatus != 0)
     {
@@ -488,6 +483,10 @@ void handleCommandLine(const String& cmdLine, const char* source)
         g_enableDisplay = true;
         logCommandMessage(String("[CMD][") + source + "] Display enable requested");
     }
+    else
+    {
+        logCommandMessage(String("[CMD][") + source + "] Unsupported command. Use: w 0 | w 1 | d 0 | d 1 | s 0 | s 1");
+    }
 }
 
 void processCommandStream(Stream& stream, String& buffer, const char* source)
@@ -538,12 +537,15 @@ bool initBluetooth()
             Serial.println("[BT] SPP server started");
             break;
         case ESP_SPP_SRV_OPEN_EVT:
+            g_btClientConnected = true;
             Serial.println("[BT] Client connected (SRV_OPEN)");
             break;
         case ESP_SPP_OPEN_EVT:
+            g_btClientConnected = true;
             Serial.println("[BT] Client connected (OPEN)");
             break;
         case ESP_SPP_CLOSE_EVT:
+            g_btClientConnected = false;
             Serial.print("[BT] Client disconnected, close.status = ");
             if (param != nullptr)
             {
@@ -678,25 +680,6 @@ void enterStandbyLowPowerMode()
     stopRangingIfNeeded();
     stopDisplayIfNeeded();
 
-    if (g_normalCpuFreqMhz <= 0)
-    {
-        g_normalCpuFreqMhz = getCpuFrequencyMhz();
-    }
-
-    if (getCpuFrequencyMhz() != STANDBY_CPU_FREQ_MHZ)
-    {
-        if (setCpuFrequencyMhz(STANDBY_CPU_FREQ_MHZ))
-        {
-            Serial.print("[INFO] CPU frequency lowered to ");
-            Serial.print(STANDBY_CPU_FREQ_MHZ);
-            Serial.println(" MHz");
-        }
-        else
-        {
-            Serial.println("[WARN] Failed to lower CPU frequency");
-        }
-    }
-
     enableBluetoothLowPowerMode();
     g_isLowPowerActive = true;
     Serial.println("[INFO] Standby low-power mode entered");
@@ -710,20 +693,6 @@ void exitStandbyLowPowerMode()
     }
 
     disableBluetoothLowPowerMode();
-
-    if (g_normalCpuFreqMhz > 0 && getCpuFrequencyMhz() != g_normalCpuFreqMhz)
-    {
-        if (setCpuFrequencyMhz(g_normalCpuFreqMhz))
-        {
-            Serial.print("[INFO] CPU frequency restored to ");
-            Serial.print(g_normalCpuFreqMhz);
-            Serial.println(" MHz");
-        }
-        else
-        {
-            Serial.println("[WARN] Failed to restore CPU frequency");
-        }
-    }
 
     g_isLowPowerActive = false;
     Serial.println("[INFO] Standby low-power mode exited");
@@ -746,7 +715,6 @@ void setup()
     g_isBluetoothInitialized = initBluetooth();
 
     Wire.begin(I2C_SDA, I2C_SCL);
-    g_normalCpuFreqMhz = getCpuFrequencyMhz();
     Serial.println("[INFO] Display switch default is OFF (use d 1 to enable)");
     Serial.println("[INFO] Standby mode is ON by default (connect BT to wake, use s 0 to disable)");
 }
@@ -766,6 +734,7 @@ void loop()
     static bool lastHttpEnabled = false;
     static bool lastDisplayEnabled = false;
     static bool lastBtClientConnected = false;
+    static uint32_t btDisconnectedSinceMs = 0;
     static uint32_t lastRangingInitAttemptMs = 0;
     static uint32_t lastWiFiAttemptMs = 0;
     static uint32_t lastDisplayInitAttemptMs = 0;
@@ -787,19 +756,32 @@ void loop()
         lastSampleMs = now - SAMPLE_INTERVAL_MS;
     }
 
-    const bool btClientConnected = g_isBluetoothInitialized && SerialBT.hasClient();
+    const bool btClientConnected = g_isBluetoothInitialized && g_btClientConnected;
     if (lastBtClientConnected != btClientConnected)
     {
         if (btClientConnected)
         {
             exitStandbyLowPowerMode();
+            btDisconnectedSinceMs = 0;
         }
         else
+        {
+            btDisconnectedSinceMs = now;
+        }
+    }
+    lastBtClientConnected = btClientConnected;
+
+    if (!btClientConnected && !g_isLowPowerActive)
+    {
+        if (btDisconnectedSinceMs == 0)
+        {
+            btDisconnectedSinceMs = now;
+        }
+        if (now - btDisconnectedSinceMs >= STANDBY_ENTER_DELAY_MS)
         {
             enterStandbyLowPowerMode();
         }
     }
-    lastBtClientConnected = btClientConnected;
 
     if (g_isLowPowerActive)
     {
