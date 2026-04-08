@@ -7,6 +7,23 @@
 #include <HTTPClient.h>
 #include <BluetoothSerial.h>
 #include <algorithm>
+#include <esp_spp_api.h>
+#include <esp_bt_main.h>
+#if __has_include(<esp_bt.h>)
+#include <esp_bt.h>
+#define HAS_ESP_BT_H 1
+#else
+#define HAS_ESP_BT_H 0
+#endif
+#if __has_include(<esp_idf_version.h>)
+#include <esp_idf_version.h>
+#endif
+
+#if HAS_ESP_BT_H && defined(ESP_IDF_VERSION_MAJOR) && (ESP_IDF_VERSION_MAJOR >= 5)
+#define HAS_BT_MODEM_SLEEP_API 1
+#else
+#define HAS_BT_MODEM_SLEEP_API 0
+#endif
 
 // =========================
 // arguments
@@ -78,8 +95,12 @@ Adafruit_VL53L1X vl53 = Adafruit_VL53L1X();
 BluetoothSerial SerialBT;
 bool g_isRangingActive = false;
 bool g_isWiFiActive = false;
-bool g_isBluetoothActive = false;
+bool g_isBluetoothInitialized = false;
 bool g_isDisplayActive = false;
+bool g_isLowPowerActive = false;
+int g_normalCpuFreqMhz = 0;
+
+constexpr int STANDBY_CPU_FREQ_MHZ = 80;
 
 // =========================
 // helper function
@@ -439,7 +460,7 @@ void reportDistanceJson(bool hasValidDistance, int distanceMm, int sampleCount, 
 void logCommandMessage(const String& msg)
 {
     Serial.println(msg);
-    if (g_isBluetoothActive && SerialBT.hasClient())
+    if (g_isBluetoothInitialized && SerialBT.hasClient())
     {
         SerialBT.println(msg);
     }
@@ -466,10 +487,6 @@ void handleCommandLine(const String& cmdLine, const char* source)
     {
         g_enableDisplay = true;
         logCommandMessage(String("[CMD][") + source + "] Display enable requested");
-    }
-    else
-    {
-        logCommandMessage(String("[CMD][") + source + "] Unsupported command. Use: w 0 | w 1 | d 0 | d 1");
     }
 }
 
@@ -503,7 +520,7 @@ void processCommands()
     static String btCmd;
 
     processCommandStream(Serial, serialCmd, "SERIAL");
-    if (g_isBluetoothActive)
+    if (g_isBluetoothInitialized)
     {
         processCommandStream(SerialBT, btCmd, "BT");
     }
@@ -511,6 +528,39 @@ void processCommands()
 
 bool initBluetooth()
 {
+    static auto btSppCallback = [](esp_spp_cb_event_t event, esp_spp_cb_param_t* param) {
+        switch (event)
+        {
+        case ESP_SPP_INIT_EVT:
+            Serial.println("[BT] SPP init done");
+            break;
+        case ESP_SPP_START_EVT:
+            Serial.println("[BT] SPP server started");
+            break;
+        case ESP_SPP_SRV_OPEN_EVT:
+            Serial.println("[BT] Client connected (SRV_OPEN)");
+            break;
+        case ESP_SPP_OPEN_EVT:
+            Serial.println("[BT] Client connected (OPEN)");
+            break;
+        case ESP_SPP_CLOSE_EVT:
+            Serial.print("[BT] Client disconnected, close.status = ");
+            if (param != nullptr)
+            {
+                Serial.println(static_cast<int>(param->close.status));
+            }
+            else
+            {
+                Serial.println("-1");
+            }
+            break;
+        default:
+            break;
+        }
+    };
+
+    SerialBT.register_callback(btSppCallback);
+
     if (!SerialBT.begin(BT_DEVICE_NAME))
     {
         Serial.println("[WARN] Bluetooth init failed");
@@ -523,12 +573,12 @@ bool initBluetooth()
 
 void stopBluetoothIfNeeded()
 {
-    if (!g_isBluetoothActive)
+    if (!g_isBluetoothInitialized)
     {
         return;
     }
     SerialBT.end();
-    g_isBluetoothActive = false;
+    g_isBluetoothInitialized = false;
     Serial.println("[INFO] Bluetooth stopped");
 }
 
@@ -539,7 +589,6 @@ void stopWiFiIfNeeded()
         return;
     }
 
-    g_enableRanging = false;
     WiFi.disconnect(true, true);
     WiFi.mode(WIFI_OFF);
     g_isWiFiActive = false;
@@ -570,6 +619,116 @@ void stopDisplayIfNeeded()
     Serial.println("[INFO] Display stopped");
 }
 
+void enableBluetoothLowPowerMode()
+{
+    if (!g_isBluetoothInitialized)
+    {
+        return;
+    }
+
+#if HAS_BT_MODEM_SLEEP_API
+    esp_err_t err = esp_bt_sleep_enable();
+    if (err == ESP_OK)
+    {
+        Serial.println("[INFO] Bluetooth low-power sleep enabled");
+    }
+    else
+    {
+        Serial.print("[WARN] Bluetooth low-power sleep enable failed, err = ");
+        Serial.println(static_cast<int>(err));
+    }
+#else
+    Serial.println("[INFO] Bluetooth low-power sleep API unavailable on this core, skipped");
+#endif
+}
+
+void disableBluetoothLowPowerMode()
+{
+    if (!g_isBluetoothInitialized)
+    {
+        return;
+    }
+
+#if HAS_BT_MODEM_SLEEP_API
+    esp_err_t err = esp_bt_sleep_disable();
+    if (err == ESP_OK)
+    {
+        Serial.println("[INFO] Bluetooth low-power sleep disabled");
+    }
+    else
+    {
+        Serial.print("[WARN] Bluetooth low-power sleep disable failed, err = ");
+        Serial.println(static_cast<int>(err));
+    }
+#endif
+}
+
+void enterStandbyLowPowerMode()
+{
+    if (g_isLowPowerActive)
+    {
+        return;
+    }
+
+    g_enableHttpReport = false;
+    g_enableDisplay = false;
+    g_enableRanging = false;
+
+    stopWiFiIfNeeded();
+    stopRangingIfNeeded();
+    stopDisplayIfNeeded();
+
+    if (g_normalCpuFreqMhz <= 0)
+    {
+        g_normalCpuFreqMhz = getCpuFrequencyMhz();
+    }
+
+    if (getCpuFrequencyMhz() != STANDBY_CPU_FREQ_MHZ)
+    {
+        if (setCpuFrequencyMhz(STANDBY_CPU_FREQ_MHZ))
+        {
+            Serial.print("[INFO] CPU frequency lowered to ");
+            Serial.print(STANDBY_CPU_FREQ_MHZ);
+            Serial.println(" MHz");
+        }
+        else
+        {
+            Serial.println("[WARN] Failed to lower CPU frequency");
+        }
+    }
+
+    enableBluetoothLowPowerMode();
+    g_isLowPowerActive = true;
+    Serial.println("[INFO] Standby low-power mode entered");
+}
+
+void exitStandbyLowPowerMode()
+{
+    if (!g_isLowPowerActive)
+    {
+        return;
+    }
+
+    disableBluetoothLowPowerMode();
+
+    if (g_normalCpuFreqMhz > 0 && getCpuFrequencyMhz() != g_normalCpuFreqMhz)
+    {
+        if (setCpuFrequencyMhz(g_normalCpuFreqMhz))
+        {
+            Serial.print("[INFO] CPU frequency restored to ");
+            Serial.print(g_normalCpuFreqMhz);
+            Serial.println(" MHz");
+        }
+        else
+        {
+            Serial.println("[WARN] Failed to restore CPU frequency");
+        }
+    }
+
+    g_isLowPowerActive = false;
+    Serial.println("[INFO] Standby low-power mode exited");
+}
+
 // =========================
 // Arduino entry
 // =========================
@@ -584,10 +743,12 @@ void setup()
     Serial.println("ESP32 + VL53L1X + OLED Test");
     Serial.println("================================");
 
-    g_isBluetoothActive = initBluetooth();
+    g_isBluetoothInitialized = initBluetooth();
 
     Wire.begin(I2C_SDA, I2C_SCL);
+    g_normalCpuFreqMhz = getCpuFrequencyMhz();
     Serial.println("[INFO] Display switch default is OFF (use d 1 to enable)");
+    Serial.println("[INFO] Standby mode is ON by default (connect BT to wake, use s 0 to disable)");
 }
 
 void loop()
@@ -626,17 +787,25 @@ void loop()
         lastSampleMs = now - SAMPLE_INTERVAL_MS;
     }
 
-    const bool btClientConnected = g_isBluetoothActive && SerialBT.hasClient();
-    if (lastBtClientConnected && !btClientConnected)
+    const bool btClientConnected = g_isBluetoothInitialized && SerialBT.hasClient();
+    if (lastBtClientConnected != btClientConnected)
     {
-        if (g_enableHttpReport || g_isWiFiActive)
+        if (btClientConnected)
         {
-            g_enableHttpReport = false;
-            stopWiFiIfNeeded();
-            Serial.println("[INFO] Bluetooth disconnected, WiFi auto disabled");
+            exitStandbyLowPowerMode();
+        }
+        else
+        {
+            enterStandbyLowPowerMode();
         }
     }
     lastBtClientConnected = btClientConnected;
+
+    if (g_isLowPowerActive)
+    {
+        delay(120);
+        return;
+    }
 
     // Runtime WiFi on/off handling
     if (g_enableHttpReport && !g_isWiFiActive)
