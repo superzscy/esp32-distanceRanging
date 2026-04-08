@@ -91,7 +91,19 @@ constexpr uint8_t MAX_EMPTY_WINDOWS_BEFORE_RECOVER = 3;
 // =========================
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
-Adafruit_VL53L1X vl53 = Adafruit_VL53L1X();
+
+class SafeAdafruitVL53L1X : public Adafruit_VL53L1X
+{
+public:
+    SafeAdafruitVL53L1X()
+        : Adafruit_VL53L1X()
+    {
+        // Work around library default-pin conversion issue: force "no GPIO control".
+        gpio0 = -1;
+    }
+};
+
+SafeAdafruitVL53L1X vl53;
 BluetoothSerial SerialBT;
 bool g_isRangingActive = false;
 bool g_isWiFiActive = false;
@@ -101,6 +113,21 @@ bool g_isLowPowerActive = false;
 volatile bool g_btClientConnected = false;
 
 constexpr uint32_t STANDBY_ENTER_DELAY_MS = 1500;
+
+enum class CalibrationCmd : uint8_t
+{
+    None = 0,
+    C1,
+    C2
+};
+
+bool g_hasInitialHeight = false;
+int g_initialHeightMm = 0;
+CalibrationCmd g_pendingCalibrationCmd = CalibrationCmd::None;
+
+void logCommandMessage(const String& msg);
+void stopRangingIfNeeded();
+void stopWiFiIfNeeded();
 
 // =========================
 // helper function
@@ -452,6 +479,167 @@ void reportDistanceJson(bool hasValidDistance, int distanceMm, int sampleCount, 
     http.end();
 }
 
+bool sampleHeightAverageOneSecond(int& outAverageMm, int& outSampleCount, int& outValidCount)
+{
+    const bool wasRangingEnabled = g_enableRanging;
+    const bool wasRangingActive = g_isRangingActive;
+
+    if (!g_isRangingActive)
+    {
+        if (!initVL53L1X())
+        {
+            return false;
+        }
+        g_isRangingActive = true;
+    }
+
+    int samples[SAMPLES_PER_SECOND];
+    int sampleCount = 0;
+    int validCount = 0;
+    uint32_t windowStartMs = millis();
+    uint32_t lastSampleMs = windowStartMs - SAMPLE_INTERVAL_MS;
+
+    while (millis() - windowStartMs < STATS_WINDOW_MS)
+    {
+        const uint32_t now = millis();
+        if (now - lastSampleMs >= SAMPLE_INTERVAL_MS)
+        {
+            lastSampleMs = now;
+            int distanceMm = 0;
+            bool hadDataReady = false;
+            bool valid = readDistanceMm(distanceMm, hadDataReady);
+            if (valid && sampleCount < static_cast<int>(SAMPLES_PER_SECOND))
+            {
+                samples[sampleCount++] = distanceMm;
+                ++validCount;
+            }
+        }
+        delay(2);
+    }
+
+    bool ok = computeStableAverageMm(samples, sampleCount, outAverageMm);
+    outSampleCount = sampleCount;
+    outValidCount = validCount;
+
+    if (!wasRangingActive)
+    {
+        stopRangingIfNeeded();
+    }
+    g_enableRanging = wasRangingEnabled;
+    return ok;
+}
+
+bool reportCalibrationDeltaOnce(int initialMm, int currentMm, int deltaMm)
+{
+    bool tempWiFiStarted = false;
+
+    if (!g_isWiFiActive)
+    {
+        g_isWiFiActive = initWiFi();
+        tempWiFiStarted = g_isWiFiActive;
+    }
+
+    if (!g_isWiFiActive || WiFi.status() != WL_CONNECTED)
+    {
+        Serial.println("[WARN] c2 report skipped: WiFi not connected");
+        return false;
+    }
+
+    String payload = "{";
+    payload += "\"ts_ms\":";
+    payload += millis();
+    payload += ",\"event\":\"c2_delta\"";
+    payload += ",\"initial_height_mm\":";
+    payload += initialMm;
+    payload += ",\"current_height_mm\":";
+    payload += currentMm;
+    payload += ",\"delta_mm\":";
+    payload += deltaMm;
+    payload += "}";
+
+    HTTPClient http;
+    const String url = buildReportUrl();
+    if (!http.begin(url))
+    {
+        Serial.println("[WARN] c2 report HTTP begin failed");
+        if (tempWiFiStarted)
+        {
+            stopWiFiIfNeeded();
+        }
+        return false;
+    }
+
+    http.addHeader("Content-Type", "application/json");
+    const int code = http.POST(payload);
+    http.end();
+
+    if (tempWiFiStarted)
+    {
+        stopWiFiIfNeeded();
+    }
+
+    if (code > 0)
+    {
+        Serial.print("[INFO] c2 report POST code = ");
+        Serial.println(code);
+        return true;
+    }
+
+    Serial.print("[WARN] c2 report POST failed, code = ");
+    Serial.println(code);
+    return false;
+}
+
+void runCalibrationCommand(CalibrationCmd cmd)
+{
+    int avgMm = 0;
+    int sampleCount = 0;
+    int validCount = 0;
+
+    if (cmd == CalibrationCmd::C1)
+    {
+        logCommandMessage("[CMD] c1 start: sampling 1s...");
+        if (!sampleHeightAverageOneSecond(avgMm, sampleCount, validCount))
+        {
+            logCommandMessage(String("[CMD] c1 failed: no stable data, samples=") + sampleCount + ", valid=" + validCount);
+            return;
+        }
+
+        g_initialHeightMm = avgMm;
+        g_hasInitialHeight = true;
+        logCommandMessage(String("[CMD] c1 done: initial_height_mm=") + g_initialHeightMm + ", samples=" + sampleCount + ", valid=" + validCount);
+        return;
+    }
+
+    if (cmd == CalibrationCmd::C2)
+    {
+        if (!g_hasInitialHeight)
+        {
+            logCommandMessage("[CMD] c2 failed: initial height not set, run c1 first");
+            return;
+        }
+
+        logCommandMessage("[CMD] c2 start: sampling 1s...");
+        if (!sampleHeightAverageOneSecond(avgMm, sampleCount, validCount))
+        {
+            logCommandMessage(String("[CMD] c2 failed: no stable data, samples=") + sampleCount + ", valid=" + validCount);
+            return;
+        }
+
+        const int deltaMm = avgMm - g_initialHeightMm;
+        logCommandMessage(String("[CMD] c2 done: current_mm=") + avgMm + ", initial_mm=" + g_initialHeightMm + ", delta_mm=" + deltaMm);
+
+        if (!reportCalibrationDeltaOnce(g_initialHeightMm, avgMm, deltaMm))
+        {
+            logCommandMessage("[CMD] c2 report failed");
+        }
+        else
+        {
+            logCommandMessage("[CMD] c2 report sent");
+        }
+    }
+}
+
 void logCommandMessage(const String& msg)
 {
     Serial.println(msg);
@@ -483,9 +671,19 @@ void handleCommandLine(const String& cmdLine, const char* source)
         g_enableDisplay = true;
         logCommandMessage(String("[CMD][") + source + "] Display enable requested");
     }
+    else if (cmdLine == "c1")
+    {
+        g_pendingCalibrationCmd = CalibrationCmd::C1;
+        logCommandMessage(String("[CMD][") + source + "] c1 queued");
+    }
+    else if (cmdLine == "c2")
+    {
+        g_pendingCalibrationCmd = CalibrationCmd::C2;
+        logCommandMessage(String("[CMD][") + source + "] c2 queued");
+    }
     else
     {
-        logCommandMessage(String("[CMD][") + source + "] Unsupported command. Use: w 0 | w 1 | d 0 | d 1 | s 0 | s 1");
+        logCommandMessage(String("[CMD][") + source + "] Unsupported command. Use: w 0 | w 1 | d 0 | d 1 | c1 | c2");
     }
 }
 
@@ -787,6 +985,13 @@ void loop()
     {
         delay(120);
         return;
+    }
+
+    if (g_pendingCalibrationCmd != CalibrationCmd::None)
+    {
+        CalibrationCmd cmd = g_pendingCalibrationCmd;
+        g_pendingCalibrationCmd = CalibrationCmd::None;
+        runCalibrationCommand(cmd);
     }
 
     // Runtime WiFi on/off handling
