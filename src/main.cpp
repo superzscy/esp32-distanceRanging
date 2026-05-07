@@ -80,6 +80,15 @@ constexpr int SCREEN_HEIGHT = 32;
 constexpr int OLED_RESET    = -1;
 constexpr uint8_t OLED_ADDR = 0x3C;
 
+// battery arguments
+// Adjust BATTERY_DIVIDER_RATIO according to your voltage divider hardware.
+constexpr int BATTERY_ADC_PIN = 34;
+constexpr float BATTERY_DIVIDER_RATIO = 2.0f;
+constexpr int BATTERY_EMPTY_MV = 3300;
+constexpr int BATTERY_FULL_MV = 4200;
+constexpr uint32_t BATTERY_READ_INTERVAL_MS = 30000;
+constexpr int BATTERY_ADC_SAMPLES = 8;
+
 // refresh arguments
 constexpr uint16_t SAMPLES_PER_SECOND = 10;
 constexpr uint32_t STATS_WINDOW_MS    = 1000;
@@ -124,6 +133,10 @@ enum class CalibrationCmd : uint8_t
 bool g_hasInitialHeight = false;
 int g_initialHeightMm = 0;
 CalibrationCmd g_pendingCalibrationCmd = CalibrationCmd::None;
+
+int g_batteryVoltageMv = 0;
+int g_batteryPercent = -1;
+String g_batteryLevel = "unknown";
 
 void logCommandMessage(const String& msg);
 void stopRangingIfNeeded();
@@ -422,6 +435,87 @@ bool initWiFi()
     return true;
 }
 
+const char* classifyBatteryLevel(int percent)
+{
+    if (percent < 0)
+    {
+        return "unknown";
+    }
+    if (percent < 30)
+    {
+        return "low";
+    }
+    if (percent < 70)
+    {
+        return "medium";
+    }
+    return "high";
+}
+
+bool readBatteryVoltageMv(int& outVoltageMv)
+{
+    int32_t sum = 0;
+    int valid = 0;
+    for (int i = 0; i < BATTERY_ADC_SAMPLES; ++i)
+    {
+        int mv = analogReadMilliVolts(BATTERY_ADC_PIN);
+        if (mv > 0)
+        {
+            sum += mv;
+            ++valid;
+        }
+        delay(2);
+    }
+
+    if (valid <= 0)
+    {
+        return false;
+    }
+
+    const float adcMv = static_cast<float>(sum) / static_cast<float>(valid);
+    outVoltageMv = static_cast<int>(adcMv * BATTERY_DIVIDER_RATIO + 0.5f);
+    return true;
+}
+
+void updateBatteryStatus(bool forceLog = false)
+{
+    static uint32_t lastReadMs = 0;
+    static int lastLoggedPercent = -1000;
+
+    uint32_t now = millis();
+    if (!forceLog && (now - lastReadMs) < BATTERY_READ_INTERVAL_MS)
+    {
+        return;
+    }
+    lastReadMs = now;
+
+    int voltageMv = 0;
+    if (!readBatteryVoltageMv(voltageMv))
+    {
+        Serial.println("[WARN] Battery read failed");
+        return;
+    }
+
+    int percent = (voltageMv - BATTERY_EMPTY_MV) * 100 / (BATTERY_FULL_MV - BATTERY_EMPTY_MV);
+    percent = constrain(percent, 0, 100);
+    const char* level = classifyBatteryLevel(percent);
+
+    g_batteryVoltageMv = voltageMv;
+    g_batteryPercent = percent;
+    g_batteryLevel = level;
+
+    if (forceLog || abs(percent - lastLoggedPercent) >= 3)
+    {
+        Serial.print("[INFO] Battery: ");
+        Serial.print(g_batteryVoltageMv);
+        Serial.print(" mV, ");
+        Serial.print(g_batteryPercent);
+        Serial.print("%, ");
+        Serial.println(g_batteryLevel);
+        lastLoggedPercent = percent;
+    }
+}
+
 void reportDistanceJson(bool hasValidDistance, int distanceMm, int sampleCount, int dataReadyCount, int validCount)
 {
     if (!g_enableHttpReport || !g_isWiFiActive)
@@ -454,6 +548,13 @@ void reportDistanceJson(bool hasValidDistance, int distanceMm, int sampleCount, 
     payload += dataReadyCount;
     payload += ",\"valid_count\":";
     payload += validCount;
+    payload += ",\"battery_mv\":";
+    payload += g_batteryVoltageMv;
+    payload += ",\"battery_percent\":";
+    payload += g_batteryPercent;
+    payload += ",\"battery_level\":\"";
+    payload += g_batteryLevel;
+    payload += "\"";
     payload += "}";
 
     HTTPClient http;
@@ -555,6 +656,13 @@ bool reportCalibrationDeltaOnce(int initialMm, int currentMm, int deltaMm)
     payload += currentMm;
     payload += ",\"delta_mm\":";
     payload += deltaMm;
+    payload += ",\"battery_mv\":";
+    payload += g_batteryVoltageMv;
+    payload += ",\"battery_percent\":";
+    payload += g_batteryPercent;
+    payload += ",\"battery_level\":\"";
+    payload += g_batteryLevel;
+    payload += "\"";
     payload += "}";
 
     HTTPClient http;
@@ -913,6 +1021,12 @@ void setup()
     g_isBluetoothInitialized = initBluetooth();
 
     Wire.begin(I2C_SDA, I2C_SCL);
+#if defined(ADC_11db)
+    analogSetPinAttenuation(BATTERY_ADC_PIN, ADC_11db);
+#elif defined(ADC_ATTEN_DB_12)
+    analogSetPinAttenuation(BATTERY_ADC_PIN, ADC_ATTEN_DB_12);
+#endif
+    updateBatteryStatus(true);
     Serial.println("[INFO] Display switch default is OFF (use d 1 to enable)");
     Serial.println("[INFO] Standby mode is ON by default (connect BT to wake, use s 0 to disable)");
 }
@@ -953,6 +1067,8 @@ void loop()
         windowStartMs = now;
         lastSampleMs = now - SAMPLE_INTERVAL_MS;
     }
+
+    updateBatteryStatus(false);
 
     const bool btClientConnected = g_isBluetoothInitialized && g_btClientConnected;
     if (lastBtClientConnected != btClientConnected)
